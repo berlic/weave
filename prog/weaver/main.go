@@ -235,7 +235,7 @@ func main() {
 		Log.Fatal("At most one of --observer, --ipam-seed or --init-peer-count may be specified.")
 	}
 	if iprangeCIDR != "" {
-		allocator, defaultSubnet = createAllocator(router.Router, ipamSeedStr, iprangeCIDR, ipsubnetCIDR, determineQuorum(observer, peerCount, peers), db, isKnownPeer)
+		allocator, defaultSubnet = createAllocator(router, ipamSeedStr, iprangeCIDR, ipsubnetCIDR, observer, peerCount, db, isKnownPeer)
 		observeContainers(allocator)
 		ids, err := dockerCli.AllContainerIDs()
 		checkFatal(err)
@@ -361,7 +361,7 @@ func parseAndCheckCIDR(cidrStr string) address.CIDR {
 	return cidr
 }
 
-func createAllocator(router *mesh.Router, ipamSeedStr, ipRangeStr string, defaultSubnetStr string, quorum uint, db db.DB, isKnownPeer func(mesh.PeerName) bool) (*ipam.Allocator, address.CIDR) {
+func createAllocator(router *weave.NetworkRouter, ipamSeedStr, ipRangeStr string, defaultSubnetStr string, isObserver bool, peerCount int, db db.DB, isKnownPeer func(mesh.PeerName) bool) (*ipam.Allocator, address.CIDR) {
 	seed := parseIPAMSeed(ipamSeedStr)
 	ipRange := parseAndCheckCIDR(ipRangeStr)
 	defaultSubnet := ipRange
@@ -378,7 +378,8 @@ func createAllocator(router *mesh.Router, ipamSeedStr, ipRangeStr string, defaul
 		OurNickname: router.Ourself.Peer.NickName,
 		Seed:        seed,
 		Universe:    ipRange.Range(),
-		Quorum:      quorum,
+		IsObserver:  isObserver,
+		GetQuorum:   func() uint { return determineQuorum(peerCount, router) },
 		Db:          db,
 		IsKnownPeer: isKnownPeer,
 	}
@@ -408,16 +409,13 @@ func createDNSServer(config dnsConfig, router *mesh.Router, isKnownPeer func(mes
 	return ns, dnsserver
 }
 
-// Pick a quorum size heuristically based on the number of peer
-// addresses passed.
-func determineQuorum(observer bool, initPeerCountFlag int, peers []string) uint {
-	if observer {
-		return uint(0)
-	}
-
+// Pick a quorum size based on the number of peer addresses.
+func determineQuorum(initPeerCountFlag int, router *weave.NetworkRouter) uint {
 	if initPeerCountFlag > 0 {
 		return uint(initPeerCountFlag/2 + 1)
 	}
+
+	peers := router.ConnectionMaker.Targets()
 
 	// Guess a suitable quorum size based on the list of peer
 	// addresses.  The peer list might or might not contain an
