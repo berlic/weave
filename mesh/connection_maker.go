@@ -270,6 +270,9 @@ func (cm *ConnectionMaker) connectToTargets(validTarget map[string]struct{}, dir
 			continue
 		}
 		if _, valid := validTarget[address]; !valid {
+			if _, direct := directTarget[address]; direct {
+				continue
+			}
 			delete(cm.targets, address)
 			continue
 		}
