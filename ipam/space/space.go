@@ -105,6 +105,18 @@ func (s *Space) NumFreeAddressesInRange(r address.Range) address.Count {
 	return res
 }
 
+// IsFree checks whether there are no claimed addresses within
+// the given address range.
+func (s *Space) IsFree(r address.Range) bool {
+	return r.Size() == s.NumFreeAddressesInRange(r)
+}
+
+// IsFull checks whether there are any free addresses within
+// the given address range.
+func (s *Space) IsFull(r address.Range) bool {
+	return s.NumFreeAddressesInRange(r) == 0
+}
+
 func (s *Space) Free(addr address.Address) error {
 	if !contains(s.ours, addr) {
 		return fmt.Errorf("Address %v is not ours", addr)
@@ -130,8 +142,43 @@ func (s *Space) biggestFreeRange(r address.Range) (biggest address.Range) {
 	return
 }
 
-func (s *Space) Donate(r address.Range) (address.Range, bool) {
-	biggest := s.biggestFreeRange(r)
+func (s *Space) biggestCIDRFreeRange(r address.Range) (biggest address.CIDR) {
+	biggestSize := address.Offset(0)
+	s.walkFree(r, func(chunk address.Range) bool {
+		for _, cidr := range chunk.CIDRs() {
+			if size := cidr.Size(); size >= biggestSize {
+				biggest = cidr
+				biggestSize = size
+			}
+		}
+		return false
+	})
+	return
+}
+
+func (s *Space) Donate(r address.Range, isCIDRAligned bool,
+	ownedCIDRRanges func() []address.CIDR) (address.Range, bool) {
+
+	var chunk address.Range
+	var ok bool
+
+	if !isCIDRAligned {
+		chunk, ok = s.findNonCIDRDonation(r)
+	} else {
+		chunk, ok = s.findCIDRDonation(ownedCIDRRanges())
+	}
+
+	if ok {
+		s.remove(chunk)
+	}
+
+	return chunk, ok
+}
+
+func (s *Space) findNonCIDRDonation(r address.Range) (address.Range, bool) {
+	var biggest address.Range
+
+	biggest = s.biggestFreeRange(r)
 
 	if biggest.Size() == 0 {
 		return address.Range{}, false
@@ -141,9 +188,85 @@ func (s *Space) Donate(r address.Range) (address.Range, bool) {
 	// the resulting donation size rounds up, and in particular can't be empty.
 	biggest.Start = address.Add(biggest.Start, address.Offset(biggest.Size()/2))
 
-	s.ours = subtract(s.ours, biggest.Start, biggest.End)
-	s.free = subtract(s.free, biggest.Start, biggest.End)
 	return biggest, true
+}
+
+// findCIDRDonation tries to find a free CIDR (sub)range within the given list of
+// ranges.
+//
+// When searching for ranges we tend to find such that it would require the
+// least amount of splits. The strategy is a direct outcome of the AWS VPC
+// limitation for number of route entries per table.
+//
+// The algorithm for search is the following:
+//
+// 1) Filter out non-free ranges from the cidrs parameter.
+// 2) Return the second half of the biggest range.
+// 3) If 1) step did not return, start halving the ranges.
+// 4) Check whether the first or the second half is free.
+// 4.1) True: Return it.
+// 4.2) False: Append non-full halves to the list of the iteration.
+func (s *Space) findCIDRDonation(cidrs []address.CIDR) (address.Range, bool) {
+	var free []address.CIDR
+
+	// Check whether there exists any free CIDR range.
+	for _, cidr := range cidrs {
+		if s.IsFree(cidr.Range()) {
+			free = append(free, cidr)
+		}
+	}
+	if len(free) > 0 {
+		// Return the second half of the biggest range
+		biggest := free[0]
+		for _, cidr := range free[1:] {
+			if biggest.Size() < cidr.Size() {
+				biggest = cidr
+			}
+		}
+		if _, second, ok := biggest.Halve(); ok {
+			biggest = second
+		}
+		return biggest.Range(), true
+	}
+
+	// No free CIDR ranges, so let's start splitting them to find such.
+	// Return once we found a suitable range.
+	for len(cidrs) != 0 {
+		var next []address.CIDR
+		for _, cidr := range cidrs {
+			first, second, ok := cidr.Halve()
+			if !ok {
+				if s.IsFree(cidr.Range()) {
+					// This case is never reached, because free CIDRs of /32
+					// are checked either in 1) step or in previous iterations
+					// of the loop.
+					panic("should not reach")
+				}
+				continue
+			}
+			if s.IsFree(first.Range()) {
+				return first.Range(), true
+			}
+			if s.IsFree(second.Range()) {
+				return second.Range(), true
+			}
+			if !s.IsFull(first.Range()) {
+				next = append(next, first)
+			}
+			if !s.IsFull(second.Range()) {
+				next = append(next, second)
+			}
+		}
+		cidrs = next
+	}
+
+	return address.Range{}, false
+}
+
+// remove removes the given range from the space.
+func (s *Space) remove(r address.Range) {
+	s.ours = subtract(s.ours, r.Start, r.End)
+	s.free = subtract(s.free, r.Start, r.End)
 }
 
 func firstGreater(a []address.Address, x address.Address) int {

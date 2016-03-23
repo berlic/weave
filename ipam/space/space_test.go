@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
 	"github.com/weaveworks/weave/net/address"
 	wt "github.com/weaveworks/weave/testing"
 )
@@ -17,6 +18,10 @@ func makeSpace(start address.Address, size address.Offset) *Space {
 func ip(s string) address.Address {
 	addr, _ := address.ParseIP(s)
 	return addr
+}
+
+func emptyCIDR() []address.CIDR {
+	return nil
 }
 
 func TestLowlevel(t *testing.T) {
@@ -67,19 +72,19 @@ func TestLowlevel(t *testing.T) {
 	wt.AssertErrorInterface(t, (*error)(nil), s.Free(0), "free not allocated")
 	wt.AssertErrorInterface(t, (*error)(nil), s.Free(100), "double free")
 
-	r, ok := s.Donate(address.NewRange(0, 1000))
+	r, ok := s.Donate(address.NewRange(0, 1000), false, emptyCIDR)
 	require.True(t, ok && r.Start == 125 && r.Size() == 25, "donate")
 
 	// test Donate when addresses are scarce
 	s = New()
-	r, ok = s.Donate(address.NewRange(0, 1000))
+	r, ok = s.Donate(address.NewRange(0, 1000), false, emptyCIDR)
 	require.True(t, !ok, "donate on empty space should fail")
 	s.Add(0, 3)
 	require.NoError(t, s.Claim(0))
 	require.NoError(t, s.Claim(2))
-	r, ok = s.Donate(address.NewRange(0, 1000))
+	r, ok = s.Donate(address.NewRange(0, 1000), false, emptyCIDR)
 	require.True(t, ok && r.Start == 1 && r.End == 2, "donate")
-	r, ok = s.Donate(address.NewRange(0, 1000))
+	r, ok = s.Donate(address.NewRange(0, 1000), false, emptyCIDR)
 	require.True(t, !ok, "donate should fail")
 }
 
@@ -145,7 +150,7 @@ func TestSpaceFree(t *testing.T) {
 	// Check we are full
 	ok, _ := space.Allocate(entireRange)
 	require.True(t, !ok, "Should have failed to get address")
-	r, _ = space.Donate(entireRange)
+	r, _ = space.Donate(entireRange, false, emptyCIDR)
 	require.True(t, r.Size() == 0, "Wrong space")
 
 	// Free in the middle
@@ -196,7 +201,7 @@ func TestDonateSimple(t *testing.T) {
 	ps1 := makeSpace(ipAddr1, size)
 
 	// Empty space set should split in two and give me the second half
-	r, ok := ps1.Donate(address.NewRange(ip(testAddr1), size))
+	r, ok := ps1.Donate(address.NewRange(ip(testAddr1), size), false, emptyCIDR)
 	numGivenUp := r.Size()
 	require.True(t, ok, "Donate result")
 	require.Equal(t, "10.0.1.24", r.Start.String(), "Invalid start")
@@ -206,7 +211,7 @@ func TestDonateSimple(t *testing.T) {
 	// Now check we can give the rest up.
 	count := 0 // count to avoid infinite loop
 	for ; count < 1000; count++ {
-		r, ok := ps1.Donate(address.NewRange(ip(testAddr1), size))
+		r, ok := ps1.Donate(address.NewRange(ip(testAddr1), size), false, emptyCIDR)
 		if !ok {
 			break
 		}
@@ -239,7 +244,7 @@ func TestDonateHard(t *testing.T) {
 	}
 
 	// Now split
-	newRange, ok := spaceset.Donate(address.NewRange(start, size))
+	newRange, ok := spaceset.Donate(address.NewRange(start, size), false, emptyCIDR)
 	require.True(t, ok, "GiveUpSpace result")
 	require.Equal(t, ip("10.0.1.23"), newRange.Start)
 	require.Equal(t, address.Count(24), newRange.Size())
@@ -250,4 +255,100 @@ func TestDonateHard(t *testing.T) {
 	expected.Add(start, 23)
 	expected.ours = add(nil, ip("10.0.1.47"), ip("10.0.1.48"))
 	require.Equal(t, expected, spaceset)
+}
+
+func TestDonateCIDR(t *testing.T) {
+	var within address.Range
+	var cidrs []address.CIDR
+
+	space1 := New()
+	space1.Add(ip("10.0.0.0"), 128)
+
+	// space1 (10.0.0.0/25):
+	//  +-------------------------------------------------+
+	//  |                       Free					  |
+	//  +-------------------------------------------------+
+	//  .0                                                .128
+
+	within = addrRange("10.0.0.0", "10.0.0.255")
+	cidrs = []address.CIDR{cidr("10.0.0.0/25")}
+	space1.Claim(ip("10.0.0.1"))
+	space1.Claim(ip("10.0.0.97"))
+	chunk1, ok := space1.Donate(within, true, ownedCIDRRanges(cidrs))
+	require.True(t, ok, "")
+	require.Equal(t, addrRange("10.0.0.32", "10.0.0.63"), chunk1)
+
+	// space1 (10.0.0.0/25):
+	//  +-------------------------------------------------+
+	//  |  |A|        |Donated|     |A|     Free          |
+	//  +-------------------------------------------------+
+	//  .0 .1         .32   .64     .97					  .128
+	//
+	// (A stands for Allocated By Us)
+
+	space1.Claim(ip("10.0.0.2"))
+	within = addrRange("10.0.0.0", "10.0.0.3")
+	cidrs = []address.CIDR{cidr("10.0.0.0/30")}
+	chunk2, ok := space1.Donate(within, true, ownedCIDRRanges(cidrs))
+	require.True(t, ok, "")
+	require.Equal(t, addrRange("10.0.0.0", "10.0.0.0"), chunk2)
+
+	// space1 (10.0.0.0/30):
+	// ~~~~~~~~~~~~~~~~~~~~
+	// Allocated: 10.0.0.1, 10.0.0.2
+	// Donated: 10.0.0.0
+	// Free: 10.0.0.3
+
+	space1.Free(ip("10.0.0.1"))
+	within = addrRange("10.0.0.0", "10.0.0.2")
+	cidrs = []address.CIDR{cidr("10.0.0.1/32"), cidr("10.0.0.2/32")}
+	chunk3, ok := space1.Donate(within, true, ownedCIDRRanges(cidrs))
+	require.True(t, ok, "")
+	require.Equal(t, addrRange("10.0.0.1", "10.0.0.1"), chunk3)
+	_, ok = space1.Donate(within, true, ownedCIDRRanges(cidrs))
+	require.False(t, ok, "")
+
+	// Test the donation procedure when there exists completely free CIDR ranges:
+	cidrs = []address.CIDR{cidr("10.0.0.0/26"), cidr("10.0.0.128/25")}
+	space2 := New()
+	space2.Add(ip("10.0.0.0"), 64)
+	space2.Add(ip("10.0.0.128"), 128)
+	chunk4, ok := space2.Donate(within, true, ownedCIDRRanges(cidrs))
+	require.True(t, ok, "")
+	require.Equal(t, addrRange("10.0.0.192", "10.0.0.255"), chunk4, "")
+}
+
+func TestIsFree(t *testing.T) {
+	space1 := New()
+	space1.Add(ip("10.0.0.0"), 256)
+	require.True(t, space1.IsFree(addrRange("10.0.0.0", "10.0.0.255")))
+	require.True(t, space1.IsFree(addrRange("10.0.0.42", "10.0.0.65")))
+	space1.Claim(ip("10.0.0.43"))
+	require.False(t, space1.IsFree(addrRange("10.0.0.42", "10.0.0.65")))
+}
+
+func TestIsFull(t *testing.T) {
+	space1 := New()
+	space1.Add(ip("10.0.0.0"), 256)
+	require.False(t, space1.IsFull(addrRange("10.0.0.0", "10.0.0.255")))
+	space1.Claim(ip("10.0.0.43"))
+	require.False(t, space1.IsFull(addrRange("10.0.0.0", "10.0.0.255")))
+	space1.remove(addrRange("10.0.0.0", "10.0.0.42"))
+	require.True(t, space1.IsFull(addrRange("10.0.0.0", "10.0.0.43")))
+}
+
+// Helpers
+
+func ownedCIDRRanges(cidrs []address.CIDR) func() []address.CIDR {
+	return func() []address.CIDR { return cidrs }
+}
+
+func cidr(s string) address.CIDR {
+	c, _ := address.ParseCIDR(s)
+	return c
+}
+
+// Creates [start;end] address.Range
+func addrRange(start, end string) address.Range {
+	return address.Range{Start: ip(start), End: ip(end) + 1}
 }
